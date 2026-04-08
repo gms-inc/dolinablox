@@ -1,0 +1,255 @@
+import java.io.*;
+import java.net.*;
+import java.util.*;
+import java.util.concurrent.*;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.util.regex.*;
+
+public class DolinabloxServer {
+    private static final int PORT = 25565;
+    private static final Map<String, World> worlds = new ConcurrentHashMap<>();
+    private static final Map<String, UserData> users = new ConcurrentHashMap<>();
+    private static final String SAVE_DIR = "worlds/";
+    private static final String USERS_FILE = "users.json";
+
+    static class UserData {
+        String username, passwordHash;
+        int oklidrinPoints;
+        UserData(String u, String p, int pts) {
+            username = u; passwordHash = p; oklidrinPoints = pts;
+        }
+    }
+
+    private static String sha256(String s) {
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] h = md.digest(s.getBytes(StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            for (byte b : h) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) { return s; }
+    }
+
+    private static synchronized void saveUsers() {
+        try (PrintWriter pw = new PrintWriter(new OutputStreamWriter(new FileOutputStream(USERS_FILE), StandardCharsets.UTF_8))) {
+            StringBuilder sb = new StringBuilder("{\"users\":[");
+            boolean first = true;
+            for (UserData u : users.values()) {
+                if (!first) sb.append(",");
+                sb.append("{\"username\":\"").append(u.username)
+                  .append("\",\"password\":\"").append(u.passwordHash)
+                  .append("\",\"oklidrinPoints\":").append(u.oklidrinPoints).append("}");
+                first = false;
+            }
+            sb.append("]}");
+            pw.print(sb.toString());
+        } catch (IOException e) { System.out.println("Error saving users"); }
+    }
+
+    private static void loadUsers() {
+        File f = new File(USERS_FILE);
+        if (!f.exists()) return;
+        try {
+            StringBuilder sb = new StringBuilder();
+            try (BufferedReader br = new BufferedReader(new InputStreamReader(new FileInputStream(f), StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = br.readLine()) != null) sb.append(line);
+            }
+            Pattern p = Pattern.compile("\\{\"username\":\"([^\"]*)\",\"password\":\"([^\"]*)\",\"oklidrinPoints\":(\\d+)\\}");
+            Matcher m = p.matcher(sb.toString());
+            while (m.find()) {
+                UserData ud = new UserData(m.group(1), m.group(2), Integer.parseInt(m.group(3)));
+                users.put(ud.username, ud);
+            }
+            System.out.println("Loaded " + users.size() + " users");
+        } catch (Exception e) { System.out.println("Error loading users"); }
+    }
+
+    class World {
+        String name;
+        String mapData = "";
+        List<ClientHandler> clients = new CopyOnWriteArrayList<>();
+        World(String name) { this.name = name; }
+
+        void save() {
+            try {
+                File dir = new File(SAVE_DIR);
+                if (!dir.exists()) dir.mkdirs();
+                File file = new File(dir, name + ".map");
+                try (PrintWriter fout = new PrintWriter(new OutputStreamWriter(new FileOutputStream(file), StandardCharsets.UTF_8))) {
+                    fout.print(mapData);
+                    fout.flush();
+                }
+                System.out.println("Saved: " + file.getAbsolutePath());
+            } catch (IOException e) { System.out.println("Error saving: " + name); }
+        }
+
+        void load() {
+            File f = new File(SAVE_DIR + name + ".map");
+            if (f.exists()) {
+                try (BufferedReader fin = new BufferedReader(new InputStreamReader(new FileInputStream(f), StandardCharsets.UTF_8))) {
+                    StringBuilder sb = new StringBuilder();
+                    String line;
+                    while ((line = fin.readLine()) != null) sb.append(line);
+                    this.mapData = sb.toString();
+                } catch (IOException e) { System.out.println("Error loading: " + name); }
+            }
+        }
+    }
+
+    public void start() {
+        loadUsers();
+        loadAllWorlds();
+        try (ServerSocket serverSocket = new ServerSocket(PORT)) {
+            System.out.println("Server started on port " + PORT);
+            while (true) {
+                Socket socket = serverSocket.accept();
+                new Thread(new ClientHandler(socket)).start();
+            }
+        } catch (IOException e) { e.printStackTrace(); }
+    }
+
+    private void loadAllWorlds() {
+        File dir = new File(SAVE_DIR);
+        if (!dir.exists()) dir.mkdirs();
+        File[] files = dir.listFiles((d, name) -> name.endsWith(".map"));
+        if (files != null) {
+            for (File f : files) {
+                String worldName = f.getName().replace(".map", "");
+                World w = new World(worldName);
+                w.load();
+                worlds.put(worldName, w);
+                System.out.println("Loaded: " + worldName);
+            }
+        }
+    }
+
+    class ClientHandler implements Runnable {
+        private Socket socket;
+        private PrintWriter out;
+        private BufferedReader in;
+        private String username;
+        private World currentWorld;
+        private boolean isLoggedIn = false;
+
+        public ClientHandler(Socket s) { this.socket = s; }
+
+        public void run() {
+            try {
+                in = new BufferedReader(new InputStreamReader(socket.getInputStream(), StandardCharsets.UTF_8));
+                out = new PrintWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8), true);
+                String line;
+                while ((line = in.readLine()) != null) {
+                    String[] parts = line.split(" ", 3);
+                    if (parts.length < 1) continue;
+                    String cmd = parts[0];
+                    if (cmd.equals("REGISTER")) {
+                        if (parts.length > 2) {
+                            String uname = parts[1];
+                            String pwhash = sha256(parts[2]);
+                            if (uname.length() < 3 || uname.length() > 16) {
+                                out.println("REGISTER_FAIL invalid_name");
+                            } else if (users.containsKey(uname)) {
+                                out.println("REGISTER_FAIL already_exists");
+                            } else {
+                                users.put(uname, new UserData(uname, pwhash, 0));
+                                saveUsers();
+                                out.println("REGISTER_OK");
+                                System.out.println("Registered: " + uname);
+                            }
+                        }
+                    } else if (cmd.equals("LOGIN")) {
+                        if (parts.length > 2) {
+                            String uname = parts[1];
+                            String pwhash = sha256(parts[2]);
+                            UserData ud = users.get(uname);
+                            if (ud == null) {
+                                out.println("LOGIN_FAIL not_found");
+                            } else if (!ud.passwordHash.equals(pwhash)) {
+                                out.println("LOGIN_FAIL wrong_password");
+                            } else {
+                                isLoggedIn = true;
+                                username = uname;
+                                out.println("LOGIN_OK " + ud.oklidrinPoints);
+                                System.out.println("Logged in: " + uname);
+                            }
+                        }
+                    } else if (cmd.equals("GET_WORLDS")) {
+                        out.println("WORLDS " + String.join(",", worlds.keySet()));
+                    } else if (cmd.equals("CREATE")) {
+                        if (isLoggedIn && parts.length > 1) {
+                            String worldName = parts[1];
+                            worlds.computeIfAbsent(worldName, k -> {
+                                World w = new World(worldName);
+                                w.save();
+                                return w;
+                            });
+                            broadcastGlobal("WORLDS " + String.join(",", worlds.keySet()));
+                        }
+                    } else if (cmd.equals("JOIN")) {
+                        if (isLoggedIn && parts.length > 2) {
+                            username = parts[1];
+                            joinWorld(parts[2]);
+                        }
+                    } else if (cmd.equals("SAVE_MAP")) {
+                        if (isLoggedIn && currentWorld != null && parts.length > 2) {
+                            String incomingData = parts[2];
+                            if (incomingData.endsWith("|Unknown")) {
+                                incomingData = incomingData.substring(0, incomingData.length() - 7) + username;
+                            } else if (!incomingData.contains("|")) {
+                                incomingData += "|none|" + username;
+                            }
+                            currentWorld.mapData = incomingData;
+                            currentWorld.save();
+                            broadcast("MAP_DATA " + currentWorld.mapData);
+                            out.println("MAP_DATA " + currentWorld.mapData);
+                        }
+                    } else if (isLoggedIn && currentWorld != null) {
+                        broadcast(line);
+                    }
+                }
+            } catch (Exception e) {
+            } finally {
+                leaveWorld();
+                try { socket.close(); } catch (IOException e) {}
+            }
+        }
+
+        private void joinWorld(String name) {
+            leaveWorld();
+            currentWorld = worlds.get(name);
+            if (currentWorld != null) {
+                currentWorld.clients.add(this);
+                out.println("MAP_DATA " + currentWorld.mapData);
+                broadcast("JOIN " + username);
+            }
+        }
+
+        private void leaveWorld() {
+            if (currentWorld != null) {
+                currentWorld.clients.remove(this);
+                broadcast("LEAVE " + username);
+                currentWorld = null;
+            }
+        }
+
+        private void broadcast(String msg) {
+            if (currentWorld != null) {
+                for (ClientHandler h : currentWorld.clients) {
+                    if (h != this) h.out.println(msg);
+                }
+            }
+        }
+
+        private void broadcastGlobal(String msg) {
+            for (World w : worlds.values()) {
+                for (ClientHandler h : w.clients) h.out.println(msg);
+            }
+        }
+    }
+
+    public static void main(String[] args) {
+        new DolinabloxServer().start();
+    }
+}
